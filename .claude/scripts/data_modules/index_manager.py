@@ -252,22 +252,19 @@ class IndexManager:
             ))
             conn.commit()
 
-    def get_chapter(self, chapter: int) -> Optional[Dict]:
-        """获取章节元数据"""
+    def get_chapter(self, chapter_num: int) -> Optional[Dict]:
+        """获取章节信息"""
         with self._get_conn() as conn:
+            conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM chapters WHERE chapter = ?", (chapter,))
+            cursor.execute("""
+                SELECT * FROM chapters WHERE chapter = ?
+            """, (chapter_num,))
             row = cursor.fetchone()
             if row:
-                return self._row_to_dict(row, parse_json=["characters"])
+                return dict(row)
             return None
 
-    def get_recent_chapters(self, limit: int = None) -> List[Dict]:
-        """获取最近章节"""
-        if limit is None:
-            limit = self.config.query_recent_chapters_limit
-        with self._get_conn() as conn:
-            cursor = conn.cursor()
             cursor.execute("""
                 SELECT * FROM chapters
                 ORDER BY chapter DESC

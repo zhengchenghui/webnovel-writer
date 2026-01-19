@@ -1,343 +1,239 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Entity Linker - 实体消歧辅助模块
+Data Module: Entity Linker
+==========================
+主动实体链接与清洗模块。
+用于发现数据库中潜在的重复实体（如“药老”与“药尘”），并提供合并建议。
 
-为 Data Agent 提供实体消歧的辅助功能：
-- 置信度判断
-- 别名索引管理
-- 消歧结果记录
+功能：
+1. 计算实体相似度 (Name, Pinyin, Desc)
+2. 生成合并建议报告
+3. 执行实体合并操作 (Update References)
 """
 
+import sys
 import json
+import sqlite3
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, field
-import filelock
+from typing import List, Dict, Tuple, Optional
+from dataclasses import dataclass, asdict
+from difflib import SequenceMatcher
+try:
+    from pypinyin import lazy_pinyin
+except ImportError:
+    lazy_pinyin = None
 
 from .config import get_config
-
-try:
-    # 常见：从 scripts/ 目录运行，security_utils 在 sys.path 顶层
-    from security_utils import atomic_write_json, read_json_safe
-except ImportError:  # pragma: no cover
-    # 兼容：从仓库根目录以 `python -m scripts...` 运行
-    from scripts.security_utils import atomic_write_json, read_json_safe
-
+from .index_manager import IndexManager, EntityMeta
 
 @dataclass
-class DisambiguationResult:
-    """消歧结果"""
-    mention: str
-    entity_id: Optional[str]
-    confidence: float
-    candidates: List[str] = field(default_factory=list)
-    adopted: bool = False
-    warning: Optional[str] = None
-
+class MergeCandidate:
+    primary_id: str
+    primary_name: str
+    secondary_id: str
+    secondary_name: str
+    score: float
+    reason: str
 
 class EntityLinker:
-    """实体链接器 - 辅助 Data Agent 进行实体消歧 (v5.0 一对多别名)"""
-
     def __init__(self, config=None):
         self.config = config or get_config()
-        # v5.0: alias_index 改为一对多格式 {alias: [{"type": ..., "id": ...}, ...]}
-        self._alias_index: Dict[str, List[Dict]] = {}
-        self._state_file = self.config.state_file
-        self._load_alias_index()
+        self.index = IndexManager(self.config)
 
-    def _load_alias_index(self):
-        """从 state.json 加载 alias_index"""
-        if self._state_file.exists():
-            try:
-                with open(self._state_file, "r", encoding="utf-8") as f:
-                    state = json.load(f)
-                self._alias_index = state.get("alias_index", {})
-            except (json.JSONDecodeError, IOError):
-                self._alias_index = {}
-        else:
-            self._alias_index = {}
+    def _get_similarity(self, s1: str, s2: str) -> float:
+        """计算字符串相似度 (0-1)"""
+        if not s1 or not s2:
+            return 0.0
+        return SequenceMatcher(None, s1, s2).ratio()
 
-    def save_alias_index(self):
-        """保存 alias_index 到 state.json（v5.0 内嵌格式，锁内合并 + 原子写入）"""
-        if not self._state_file.exists():
-            return
-
-        lock_path = self._state_file.with_suffix(self._state_file.suffix + ".lock")
-        lock = filelock.FileLock(str(lock_path), timeout=10)
-        try:
-            with lock:
-                state = read_json_safe(self._state_file, default={})
-
-                disk_alias = state.get("alias_index", {})
-                if not isinstance(disk_alias, dict):
-                    disk_alias = {}
-
-                # 一对多：合并去重（避免覆盖其他进程刚写入的 state 字段/别名）
-                for alias, entries in (self._alias_index or {}).items():
-                    if not alias or not isinstance(entries, list):
-                        continue
-
-                    existing = disk_alias.get(alias)
-                    if not isinstance(existing, list):
-                        existing = []
-                        disk_alias[alias] = existing
-
-                    for entry in entries:
-                        if not isinstance(entry, dict):
-                            continue
-                        et = entry.get("type")
-                        eid = entry.get("id")
-                        if not et or not eid:
-                            continue
-                        if any(
-                            isinstance(e, dict) and e.get("type") == et and e.get("id") == eid
-                            for e in existing
-                        ):
-                            continue
-                        existing.append({"type": et, "id": eid})
-
-                state["alias_index"] = disk_alias
-
-                self.config.ensure_dirs()
-                atomic_write_json(self._state_file, state, use_lock=False, backup=True)
-
-                # 同步内存到磁盘最新快照
-                self._alias_index = disk_alias
-        except filelock.Timeout:
-            raise RuntimeError("无法获取 state.json 文件锁，请稍后重试")
-
-    # ==================== 别名管理 (v5.0 一对多) ====================
-
-    def register_alias(self, entity_id: str, alias: str, entity_type: str = "角色") -> bool:
-        """注册新别名（v5.0 一对多：同一别名可映射多个实体）"""
-        if not alias:
+    def _check_pinyin_match(self, name1: str, name2: str) -> bool:
+        """检查拼音是否匹配 (需安装 pypinyin)"""
+        if not lazy_pinyin:
             return False
+        py1 = "".join(lazy_pinyin(name1))
+        py2 = "".join(lazy_pinyin(name2))
+        return py1 == py2 or py1 in py2 or py2 in py1
 
-        if alias not in self._alias_index:
-            self._alias_index[alias] = []
+    def find_candidates(self, threshold: float = 0.8) -> List[MergeCandidate]:
+        """查找合并候选"""
+        entities = []
+        # Get all entities from DB
+        with self.index._get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM entities WHERE is_archived = 0")
+            rows = cursor.fetchall()
+            entities = [dict(r) for r in rows]
 
-        # 检查是否已存在相同 (type, id) 组合
-        for entry in self._alias_index[alias]:
-            if entry.get("type") == entity_type and entry.get("id") == entity_id:
-                return True  # 已存在，视为成功
+        candidates = []
+        seen_pairs = set()
 
-        self._alias_index[alias].append({
-            "type": entity_type,
-            "id": entity_id
-        })
-        return True
+        # O(N^2) comparison - acceptable for small N (< 2000), otherwise need indexing
+        for i in range(len(entities)):
+            for j in range(i + 1, len(entities)):
+                a = entities[i]
+                b = entities[j]
+                
+                # Only compare same type
+                if a['type'] != b['type']:
+                    continue
+                
+                # Check ID pair to avoid duplicates
+                pair_key = tuple(sorted([a['id'], b['id']]))
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
 
-    def lookup_alias(self, mention: str, entity_type: str = None) -> Optional[str]:
-        """查找别名对应的实体ID（返回第一个匹配，可选按类型过滤）"""
-        entries = self._alias_index.get(mention, [])
-        if not entries:
-            return None
+                # 1. Exact canonical name match (High risk of duplication)
+                if a['canonical_name'] == b['canonical_name']:
+                    score = 1.0
+                    reason = "Same Name"
+                else:
+                    # 2. Fuzzy name match
+                    score = self._get_similarity(a['canonical_name'], b['canonical_name'])
+                    reason = "Name Similarity"
+                    
+                    # 3. Pinyin match boost
+                    if score > 0.5 and self._check_pinyin_match(a['canonical_name'], b['canonical_name']):
+                         score = min(1.0, score + 0.2)
+                         reason += " + Pinyin"
 
-        if entity_type:
-            for entry in entries:
-                if entry.get("type") == entity_type:
-                    return entry.get("id")
-            return None
-        else:
-            return entries[0].get("id") if entries else None
+                if score >= threshold:
+                    # Determine primary (Keep the one with more content or appearances)
+                    # Heuristic: Lower tiers are secondary; fewer appearances are secondary
+                    
+                    # Simple rule: Older > Newer? No, Usually the one with proper ID > generated ID
+                    # Here we just pick A as primary for prompt, user decides
+                    
+                    # Heuristic: 'first_appearance' smaller is likely 'older' and more stable
+                    is_a_primary = a.get('first_appearance', 9999) <= b.get('first_appearance', 9999)
+                    if a.get('tier') == '核心' and b.get('tier') != '核心':
+                        is_a_primary = True
+                    elif b.get('tier') == '核心' and a.get('tier') != '核心':
+                        is_a_primary = False
+                        
+                    p, s = (a, b) if is_a_primary else (b, a)
+                    
+                    candidates.append(MergeCandidate(
+                        primary_id=p['id'],
+                        primary_name=p['canonical_name'],
+                        secondary_id=s['id'],
+                        secondary_name=s['canonical_name'],
+                        score=score,
+                        reason=reason
+                    ))
+        
+        candidates.sort(key=lambda x: x.score, reverse=True)
+        return candidates
 
-    def lookup_alias_all(self, mention: str) -> List[Dict]:
-        """查找别名对应的所有实体（一对多）"""
-        return self._alias_index.get(mention, [])
-
-    def get_all_aliases(self, entity_id: str, entity_type: str = None) -> List[str]:
-        """获取实体的所有别名"""
-        aliases = []
-        for alias, entries in self._alias_index.items():
-            for entry in entries:
-                if entry.get("id") == entity_id:
-                    if entity_type is None or entry.get("type") == entity_type:
-                        aliases.append(alias)
-                        break
-        return aliases
-
-    # ==================== 置信度判断 ====================
-
-    def evaluate_confidence(self, confidence: float) -> Tuple[str, bool, Optional[str]]:
+    def merge_entities(self, primary_id: str, secondary_id: str):
         """
-        评估置信度，返回 (action, adopt, warning)
-
-        - action: "auto" | "warn" | "manual"
-        - adopt: 是否采用
-        - warning: 警告信息
+        合并实体：
+        1. 将 Secondary 的别名移交给 Primary
+        2. 将 Secondary 的出场记录 (appearances) 归并到 Primary
+        3. 将 Secondary 的状态变化 (state_changes) 归并到 Primary
+        4. 将 Secondary 的关系 (relationships) 归并到 Primary
+        5. 将 Secondary 标记为已归档 (is_archived=1) 或物理删除
         """
-        if confidence >= self.config.extraction_confidence_high:
-            return ("auto", True, None)
-        elif confidence >= self.config.extraction_confidence_medium:
-            return ("warn", True, f"中置信度匹配 (confidence: {confidence:.2f})")
-        else:
-            return ("manual", False, f"需人工确认 (confidence: {confidence:.2f})")
+        with self.index._get_conn() as conn:
+            cursor = conn.cursor()
+            
+            try:
+                # 1. Update Aliases
+                cursor.execute("""
+                    UPDATE aliases SET entity_id = ? WHERE entity_id = ?
+                """, (primary_id, secondary_id))
+                
+                # 2. Update Appearances
+                # Need to handle duplicate primary+chapter unique constraint
+                # If primary already appeared in that chapter, we just merge mentions?
+                # SQLite 'ON CONFLICT' might be tricky with UPDATE.
+                # Logic: For each appearances of secondary:
+                #   If primary has appearance in same chapter: append mentions, update confidence
+                #   Else: update entity_id to primary
+                
+                cursor.execute("SELECT * FROM appearances WHERE entity_id = ?", (secondary_id,))
+                rows = cursor.fetchall() # Tuple rows
+                
+                # Need column mapping
+                # id, entity_id, chapter, mentions, confidence
+                
+                for row in rows:
+                    row_id = row[0]
+                    chapter = row[2]
+                    mentions = row[3]
+                    
+                    # Check primary
+                    cursor.execute("SELECT id, mentions FROM appearances WHERE entity_id = ? AND chapter = ?", (primary_id, chapter))
+                    p_row = cursor.fetchone()
+                    
+                    if p_row:
+                        # Merge
+                        p_id = p_row[0]
+                        p_mentions = p_row[1]
+                        # JSON list merge
+                        try:
+                            m1 = json.loads(mentions) if mentions else []
+                            m2 = json.loads(p_mentions) if p_mentions else []
+                            merged = list(set(m1 + m2))
+                            new_json = json.dumps(merged, ensure_ascii=False)
+                            cursor.execute("UPDATE appearances SET mentions = ? WHERE id = ?", (new_json, p_id))
+                            # Delete secondary row
+                            cursor.execute("DELETE FROM appearances WHERE id = ?", (row_id,))
+                        except:
+                            pass
+                    else:
+                        # Move
+                        cursor.execute("UPDATE appearances SET entity_id = ? WHERE id = ?", (primary_id, row_id))
 
-    def process_uncertain(
-        self,
-        mention: str,
-        candidates: List[str],
-        suggested: str,
-        confidence: float,
-        context: str = ""
-    ) -> DisambiguationResult:
-        """
-        处理不确定的实体匹配
+                # 3. Update Relationships
+                # direction: from
+                cursor.execute("UPDATE relationships SET from_entity = ? WHERE from_entity = ?", (primary_id, secondary_id))
+                # direction: to
+                cursor.execute("UPDATE relationships SET to_entity = ? WHERE to_entity = ?", (primary_id, secondary_id))
 
-        返回消歧结果，包含是否采用、警告信息等
-        """
-        action, adopt, warning = self.evaluate_confidence(confidence)
-
-        result = DisambiguationResult(
-            mention=mention,
-            entity_id=suggested if adopt else None,
-            confidence=confidence,
-            candidates=candidates,
-            adopted=adopt,
-            warning=warning
-        )
-
-        return result
-
-    # ==================== 批量处理 ====================
-
-    def process_extraction_result(
-        self,
-        uncertain_items: List[Dict]
-    ) -> Tuple[List[DisambiguationResult], List[str]]:
-        """
-        处理 AI 提取结果中的 uncertain 项
-
-        返回 (results, warnings)
-        """
-        results = []
-        warnings = []
-
-        for item in uncertain_items:
-            result = self.process_uncertain(
-                mention=item.get("mention", ""),
-                candidates=item.get("candidates", []),
-                suggested=item.get("suggested", ""),
-                confidence=item.get("confidence", 0.0),
-                context=item.get("context", "")
-            )
-            results.append(result)
-
-            if result.warning:
-                warnings.append(f"{result.mention} → {result.entity_id}: {result.warning}")
-
-        return results, warnings
-
-    def register_new_entities(
-        self,
-        new_entities: List[Dict]
-    ) -> List[str]:
-        """
-        注册新实体的别名 (v5.0)
-
-        返回注册的实体ID列表
-        """
-        registered = []
-
-        for entity in new_entities:
-            entity_id = entity.get("suggested_id") or entity.get("id")
-            if not entity_id or entity_id == "NEW":
-                continue
-
-            entity_type = entity.get("type", "角色")
-
-            # 注册主名称
-            name = entity.get("name", "")
-            if name:
-                self.register_alias(entity_id, name, entity_type)
-
-            # 注册提及方式
-            for mention in entity.get("mentions", []):
-                if mention and mention != name:
-                    self.register_alias(entity_id, mention, entity_type)
-
-            registered.append(entity_id)
-
-        return registered
-
-
-# ==================== CLI 接口 ====================
+                # 4. Update State Changes
+                cursor.execute("UPDATE state_changes SET entity_id = ? WHERE entity_id = ?", (primary_id, secondary_id))
+                
+                # 5. Archive Secondary
+                cursor.execute("UPDATE entities SET is_archived = 1 WHERE id = ?", (secondary_id,))
+                
+                conn.commit()
+                return True
+            except Exception as e:
+                print(f"Merge failed: {e}")
+                conn.rollback()
+                return False
 
 def main():
     import argparse
-
-    parser = argparse.ArgumentParser(description="Entity Linker CLI (v5.0 一对多别名)")
-    parser.add_argument("--project-root", type=str, help="项目根目录")
-
+    parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
-
-    # 注册别名
-    register_parser = subparsers.add_parser("register-alias")
-    register_parser.add_argument("--entity", required=True, help="实体ID")
-    register_parser.add_argument("--alias", required=True, help="别名")
-    register_parser.add_argument("--type", default="角色", help="实体类型（默认：角色）")
-
-    # 查找别名
-    lookup_parser = subparsers.add_parser("lookup")
-    lookup_parser.add_argument("--mention", required=True, help="提及文本")
-    lookup_parser.add_argument("--type", help="按类型过滤")
-
-    # 查找所有匹配（一对多）
-    lookup_all_parser = subparsers.add_parser("lookup-all")
-    lookup_all_parser.add_argument("--mention", required=True, help="提及文本")
-
-    # 列出别名
-    list_parser = subparsers.add_parser("list-aliases")
-    list_parser.add_argument("--entity", required=True, help="实体ID")
-    list_parser.add_argument("--type", help="实体类型")
-
+    
+    # Check
+    check_parser = subparsers.add_parser("check")
+    check_parser.add_argument("--threshold", type=float, default=0.8)
+    
+    # Merge
+    merge_parser = subparsers.add_parser("merge")
+    merge_parser.add_argument("--primary", required=True)
+    merge_parser.add_argument("--secondary", required=True)
+    
     args = parser.parse_args()
-
-    # 初始化
-    config = None
-    if args.project_root:
-        from .config import DataModulesConfig
-        config = DataModulesConfig.from_project_root(args.project_root)
-
-    linker = EntityLinker(config)
-
-    if args.command == "register-alias":
-        entity_type = getattr(args, "type", "角色")
-        success = linker.register_alias(args.entity, args.alias, entity_type)
+    
+    linker = EntityLinker()
+    
+    if args.command == "check":
+        candidates = linker.find_candidates(args.threshold)
+        print(json.dumps([asdict(c) for c in candidates], ensure_ascii=False, indent=2))
+        
+    elif args.command == "merge":
+        success = linker.merge_entities(args.primary, args.secondary)
         if success:
-            linker.save_alias_index()
-            print(f"✓ 已注册: {args.alias} → {args.entity} (类型: {entity_type})")
+            print(f"Merged {args.secondary} into {args.primary}")
         else:
-            print(f"✗ 注册失败")
-
-    elif args.command == "lookup":
-        entity_type = getattr(args, "type", None)
-        entity_id = linker.lookup_alias(args.mention, entity_type)
-        if entity_id:
-            print(f"{args.mention} → {entity_id}")
-        else:
-            print(f"未找到: {args.mention}")
-
-    elif args.command == "lookup-all":
-        entries = linker.lookup_alias_all(args.mention)
-        if entries:
-            print(f"{args.mention} 的所有匹配:")
-            for entry in entries:
-                print(f"  - {entry.get('id')} (类型: {entry.get('type')})")
-        else:
-            print(f"未找到: {args.mention}")
-
-    elif args.command == "list-aliases":
-        entity_type = getattr(args, "type", None)
-        aliases = linker.get_all_aliases(args.entity, entity_type)
-        if aliases:
-            print(f"{args.entity} 的别名:")
-            for alias in aliases:
-                print(f"  - {alias}")
-        else:
-            print(f"未找到 {args.entity} 的别名")
-
+            print("Merge failed")
 
 if __name__ == "__main__":
     main()
