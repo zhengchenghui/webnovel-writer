@@ -13,7 +13,7 @@ Copy and track progress:
 ```
 项目初始化进度：
 - [ ] Step 1: 加载题材套路 (cat "${CLAUDE_PLUGIN_ROOT}/skills/webnovel-init/references/genre-tropes.md")
-- [ ] Step 2: 加载数据规范 (cat "${CLAUDE_PLUGIN_ROOT}/skills/webnovel-init/references/system-data-flow.md")
+- [ ] Step 2: 加载数据规范 (cat "${CLAUDE_PLUGIN_ROOT}/shared-references/system-data-flow.md")
 - [ ] Step 3: 确认上下文充足
 - [ ] Step 4: 检查现有项目
 - [ ] Step 5: 收集基本信息 (AskUserQuestion)
@@ -35,7 +35,7 @@ cat "${CLAUDE_PLUGIN_ROOT}/skills/webnovel-init/references/genre-tropes.md"
 ## Step 2: 加载数据规范
 
 ```bash
-cat "${CLAUDE_PLUGIN_ROOT}/skills/webnovel-init/references/system-data-flow.md"
+cat "${CLAUDE_PLUGIN_ROOT}/shared-references/system-data-flow.md"
 ```
 
 ## Step 3: 确认上下文充足
@@ -66,10 +66,15 @@ ls .webnovel/state.json 2>/dev/null && echo "项目已存在"
 
 ## Step 5: 收集基本信息
 
+**加载命名指南**（为主角起名提供参考）：
+```bash
+cat "${CLAUDE_PLUGIN_ROOT}/shared-references/naming-guide.md"
+```
+
 **使用 AskUserQuestion 收集**：
 - 题材类型（修仙/系统流/都市异能/狗血言情）
 - 小说标题
-- 主角姓名
+- 主角姓名（参考命名指南，需符合题材风格）
 - 目标字数
 
 **参考 genre-tropes.md** 建议合适的金手指类型。

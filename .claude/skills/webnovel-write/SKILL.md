@@ -73,9 +73,10 @@ allowed-tools: Read Write Edit Grep Bash Task
 - **设定即物理**: 实力 ≤ 上下文包中的设定
 - **纯正文**: 不需要写任何 XML 标签
 
-**加载核心约束**:
+**加载核心约束与命名指南**:
 ```bash
-cat "${CLAUDE_PLUGIN_ROOT}/skills/webnovel-write/references/core-constraints.md"
+cat "${CLAUDE_PLUGIN_ROOT}/shared-references/core-constraints.md"
+cat "${CLAUDE_PLUGIN_ROOT}/shared-references/naming-guide.md"
 ```
 
 **按需加载场景参考**:

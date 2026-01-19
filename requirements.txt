@@ -1,0 +1,11 @@
+# Webnovel Writer - Python Dependencies
+# =====================================
+
+# Core Dependencies
+aiohttp>=3.9.0          # 异步 HTTP 客户端（RAG API 调用）
+pypinyin>=0.50.0        # 拼音处理（角色名排序/搜索）
+filelock>=3.13.0        # 文件锁（state.json 并发安全）
+python-dotenv>=1.0.0    # 环境变量加载（.env 文件）
+
+# Optional: Testing
+pytest>=7.0.0           # 单元测试框架

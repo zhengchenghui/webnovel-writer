@@ -13,7 +13,7 @@ Copy and track progress:
 ```
 任务恢复进度：
 - [ ] Step 1: 加载恢复协议 (cat "${CLAUDE_PLUGIN_ROOT}/skills/webnovel-resume/references/workflow-resume.md")
-- [ ] Step 2: 加载数据规范 (cat "${CLAUDE_PLUGIN_ROOT}/skills/webnovel-resume/references/system-data-flow.md")
+- [ ] Step 2: 加载数据规范 (cat "${CLAUDE_PLUGIN_ROOT}/shared-references/system-data-flow.md")
 - [ ] Step 3: 确认上下文充足
 - [ ] Step 4: 检测中断状态
 - [ ] Step 5: 展示恢复选项 (AskUserQuestion)
@@ -37,7 +37,7 @@ cat "${CLAUDE_PLUGIN_ROOT}/skills/webnovel-resume/references/workflow-resume.md"
 ## Step 2: 加载数据规范
 
 ```bash
-cat "${CLAUDE_PLUGIN_ROOT}/skills/webnovel-resume/references/system-data-flow.md"
+cat "${CLAUDE_PLUGIN_ROOT}/shared-references/system-data-flow.md"
 ```
 
 ## Step 3: 确认上下文充足
